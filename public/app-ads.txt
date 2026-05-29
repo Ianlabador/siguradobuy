@@ -1,0 +1,9 @@
+#Updated 31.03.2026
+#Appodeal
+appodeal.com, 264393, DIRECT
+#BidMachine
+bidmachine.io,1,DIRECT
+bidmachine.io,466,DIRECT
+bidmachine.io, 200, DIRECT
+#Unity
+unity.com, 125194720, DIRECT, 96cabb5fbdde37a7
