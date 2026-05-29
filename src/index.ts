@@ -12,6 +12,7 @@ import ticketsRouter      from './routes/tickets';
 import subscriptionRouter from './routes/subscription';
 import adminRouter        from './routes/admin';
 import paypalRouter       from './routes/paypal';
+import legalRouter        from './routes/legal';
 
 dotenv.config();
 
@@ -59,6 +60,13 @@ app.use('/api/tickets',       supportRateLimit, ticketsRouter);
 app.use('/api/subscription',                  subscriptionRouter);
 app.use('/api/admin',                         adminRouter);
 app.use('/api/paypal',                        paypalRouter);
+
+// Static public assets (logo for legal pages, etc.)
+app.use(express.static(path.join(__dirname, '../../public')));
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Public legal pages (branded HTML) — /privacy and /terms
+app.use('/',                                  legalRouter);
 
 // Serve admin portal from /admin — works when API is hosted on Railway
 app.use('/admin', express.static(path.join(__dirname, '../../admin')));
