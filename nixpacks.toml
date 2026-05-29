@@ -1,0 +1,9 @@
+# Railway / Nixpacks build config for SiguradoBuy API
+# NODE_ENV=production skips devDependencies in npm ci — use npm install --include=dev
+# so that TypeScript compiler (tsc) is available during the build phase.
+
+[phases.build]
+cmds = ["npm install --include=dev", "npm run build"]
+
+[start]
+cmd = "npm start"
