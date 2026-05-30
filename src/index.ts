@@ -4,13 +4,15 @@ import helmet from 'helmet';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 
-import { globalRateLimit, checkRateLimit, reportRateLimit, supportRateLimit } from './middleware/rateLimit';
+import { globalRateLimit, checkRateLimit, reportRateLimit, supportRateLimit, analyticsRateLimit } from './middleware/rateLimit';
 import checkRouter        from './routes/check';
 import reportRouter       from './routes/report';
 import sellerRouter       from './routes/seller';
 import ticketsRouter      from './routes/tickets';
 import subscriptionRouter from './routes/subscription';
 import adminRouter        from './routes/admin';
+import adminAnalyticsRouter from './routes/adminAnalytics';
+import analyticsRouter    from './routes/analytics';
 import paypalRouter       from './routes/paypal';
 import legalRouter        from './routes/legal';
 
@@ -58,7 +60,9 @@ app.use('/api/report',       reportRateLimit, reportRouter);
 app.use('/api/seller',                        sellerRouter);
 app.use('/api/tickets',       supportRateLimit, ticketsRouter);
 app.use('/api/subscription',                  subscriptionRouter);
+app.use('/api/admin/analytics',               adminAnalyticsRouter);
 app.use('/api/admin',                         adminRouter);
+app.use('/api/analytics',     analyticsRateLimit, analyticsRouter);
 app.use('/api/paypal',                        paypalRouter);
 
 // Static public assets (logo for legal pages, etc.)

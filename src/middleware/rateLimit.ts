@@ -44,3 +44,13 @@ export const supportRateLimit = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many support requests — please wait a few minutes.' },
 });
+
+// Analytics event ingestion limiter — generous (events are frequent) but caps abuse.
+// 120 events per minute per IP.
+export const analyticsRateLimit = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many analytics events.' },
+});

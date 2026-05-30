@@ -6,6 +6,7 @@ import { scoreProduct, upsertSellerProfile } from '../services/scorer';
 import { analyzeWithAI } from '../services/ai';
 import { db } from '../db/client';
 import { normalizeUrl } from '../services/urlNormalizer';
+import { validateCheckUrl } from '../services/urlGuard';
 
 const router = Router();
 
@@ -25,6 +26,14 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
   }
 
   const { url, userId, forceDeepScan } = parsed.data;
+
+  // ── SSRF guard: reject internal/private/non-web targets before fetching ──────
+  const urlSafety = validateCheckUrl(url);
+  if (!urlSafety.ok) {
+    res.status(400).json({ error: urlSafety.reason ?? 'This link cannot be checked.' });
+    return;
+  }
+
   const startMs     = Date.now();
   const normalizedUrl = normalizeUrl(url);
   console.log(`\n[Check] ▶ ${url}${userId ? ` user:${userId}` : ' (guest)'}`);

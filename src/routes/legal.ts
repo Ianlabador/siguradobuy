@@ -1,6 +1,36 @@
 import { Router, Request, Response } from 'express';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const router = Router();
+
+// ─── GET /app-ads.txt — plain text (NOT HTML), for Appodeal authorized sellers ──
+const APP_ADS_FALLBACK = [
+  '#Appodeal',
+  'appodeal.com, 264393, DIRECT',
+  '#BidMachine',
+  'bidmachine.io,1,DIRECT',
+  'bidmachine.io,466,DIRECT',
+  'bidmachine.io, 200, DIRECT',
+  '#Unity',
+  'unity.com, 125194720, DIRECT, 96cabb5fbdde37a7',
+  '',
+].join('\n');
+
+router.get('/app-ads.txt', (_req: Request, res: Response) => {
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  // Prefer the full hosted file (public/app-ads.txt); fall back to essential lines.
+  const candidates = [
+    path.join(__dirname, '../../public/app-ads.txt'),
+    path.join(__dirname, '../public/app-ads.txt'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) { res.send(fs.readFileSync(p, 'utf8')); return; }
+    } catch { /* try next */ }
+  }
+  res.send(APP_ADS_FALLBACK);
+});
 
 const UPDATED = 'May 30, 2026';
 
