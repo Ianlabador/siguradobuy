@@ -13,6 +13,19 @@ const PAYPAL_BASE = PAYPAL_MODE === 'production'
   ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
 
+// Public base URL of this API — used for PayPal return/cancel landing pages.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL ?? 'https://siguradobuy-production.up.railway.app').replace(/\/$/, '');
+
+// True only when both PayPal credentials are present on the server.
+const PAYPAL_CONFIGURED = !!PAYPAL_CLIENT_ID && !!PAYPAL_SECRET;
+
+// ── GET /api/paypal/status ────────────────────────────────────────────────────
+// Lets the mobile app know whether billing is actually configured before
+// showing a checkout. Never leaks the secret — only a boolean + mode.
+router.get('/status', (_req: Request, res: Response): void => {
+  res.json({ configured: PAYPAL_CONFIGURED, mode: PAYPAL_MODE });
+});
+
 // Verify a PayPal webhook signature using PayPal's verify-webhook-signature API.
 // Returns true only if PayPal confirms the event is authentic.
 // SECURITY: without this, anyone could POST a fake ACTIVATED event to upgrade a user.
@@ -66,6 +79,12 @@ async function getPayPalToken(): Promise<string> {
 // ── POST /api/paypal/create-order ─────────────────────────────────────────────
 // Body: { userId, plan: 'plus' | 'pro', currency?: 'PHP' }
 router.post('/create-order', async (req: Request, res: Response): Promise<void> => {
+  // Clear, honest signal when the server has no PayPal credentials — the app
+  // shows "Billing is not configured correctly. Please contact support."
+  if (!PAYPAL_CONFIGURED) {
+    res.status(503).json({ error: 'billing_not_configured', message: 'PayPal credentials are not configured on the server.' });
+    return;
+  }
   try {
     const { userId, plan, currency = 'PHP' } = req.body ?? {};
     if (!userId || !plan) {
@@ -89,19 +108,48 @@ router.post('/create-order', async (req: Request, res: Response): Promise<void> 
           custom_id: `${userId}:${plan}`,
         }],
         application_context: {
-          brand_name: 'SiguradoBuy',
+          brand_name:  'SiguradoBuy',
           user_action: 'PAY_NOW',
+          return_url:  `${PUBLIC_BASE_URL}/api/paypal/return`,
+          cancel_url:  `${PUBLIC_BASE_URL}/api/paypal/cancel`,
         },
       },
       { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } },
     );
 
-    res.json({ orderId: data.id, status: data.status });
+    // The link the user must open to approve the payment in their browser.
+    const links: Array<{ rel: string; href: string }> = data.links ?? [];
+    const approveUrl =
+      links.find(l => l.rel === 'payer-action')?.href ??
+      links.find(l => l.rel === 'approve')?.href ??
+      null;
+
+    res.json({ orderId: data.id, status: data.status, approveUrl });
   } catch (e: any) {
     const msg = e.response?.data?.message ?? e.message;
     console.error('[PayPal] create-order error:', msg);
     res.status(500).json({ error: msg });
   }
+});
+
+// ── GET /api/paypal/return & /cancel ──────────────────────────────────────────
+// PayPal redirects the in-browser checkout here after approve/cancel. We just
+// show a simple branded page telling the user to return to the SiguradoBuy app,
+// which then calls capture-order to finalize. Plain HTML, no secrets.
+function landingPage(title: string, body: string): string {
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>SiguradoBuy</title><style>body{background:#0A0A0A;color:#fff;font-family:-apple-system,Segoe UI,Roboto,sans-serif;` +
+    `display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px}` +
+    `.c{max-width:360px}.t{color:#D4AF37;font-size:22px;font-weight:800;margin-bottom:10px}.m{color:#cfcfcf;font-size:15px;line-height:1.5}</style>` +
+    `</head><body><div class="c"><div class="t">${title}</div><div class="m">${body}</div></div></body></html>`;
+}
+
+router.get('/return', (_req: Request, res: Response): void => {
+  res.type('html').send(landingPage('Payment approved', 'You can now return to the SiguradoBuy app and tap “I’ve completed payment” to activate your plan.'));
+});
+
+router.get('/cancel', (_req: Request, res: Response): void => {
+  res.type('html').send(landingPage('Payment cancelled', 'No charge was made. Return to the SiguradoBuy app to try again.'));
 });
 
 // ── POST /api/paypal/capture-order ────────────────────────────────────────────
@@ -128,13 +176,29 @@ router.post('/capture-order', async (req: Request, res: Response): Promise<void>
     const customId = data.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id ?? '';
     const [userId, plan] = customId.split(':');
 
-    // Update Supabase subscription only after confirmed payment
+    // Update Supabase subscription only after confirmed payment.
     if (userId && plan) {
-      await db.from('profiles').update({
+      // Core update uses only columns guaranteed to exist, so the upgrade always
+      // applies even if the optional billing columns (migration 022) aren't there.
+      const { error: coreErr } = await db.from('profiles').update({
         plan,
         subscription_status: 'active',
-        subscription_source: 'paypal',
       }).eq('user_id', userId);
+      if (coreErr) console.error('[PayPal] capture core update error:', coreErr.message);
+
+      // Best-effort enrichment — these columns are added by migration 022. Non-fatal.
+      void db.from('profiles').update({
+        subscription_source: 'paypal',
+        plan_updated_at:     new Date().toISOString(),
+      }).eq('user_id', userId);
+
+      // Record a billing-history event (non-fatal if the table is absent).
+      void db.from('subscription_events').insert({
+        user_id:    userId,
+        event_type: 'purchase',
+        plan,
+        store:      'paypal',
+      });
     }
 
     res.json({
