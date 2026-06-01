@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { db } from '../db/client';
 import { authRateLimit } from '../middleware/rateLimit';
+import { notifyScamAlertApproved, notifySupportReply } from '../services/pushNotifications';
 
 const router = Router();
 
@@ -180,6 +181,38 @@ router.get('/tickets', requireAdmin, async (req: Request, res: Response): Promis
   }
 });
 
+// ── GET /api/admin/tickets/:id ────────────────────────────────────────────────
+// Full ticket detail for the admin modal: ticket + replies + reporter email.
+router.get('/tickets/:id', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { data: ticket, error } = await db
+      .from('support_tickets')
+      .select('id,subject,category,status,message,user_id,created_at,updated_at')
+      .eq('id', id)
+      .single();
+    if (error) throw error;
+
+    const { data: replies } = await db
+      .from('support_ticket_replies')
+      .select('id,message,is_staff_reply,created_at')
+      .eq('ticket_id', id)
+      .order('created_at', { ascending: true });
+
+    let userEmail = '';
+    if (ticket?.user_id) {
+      try {
+        const { data: u } = await db.auth.admin.getUserById(ticket.user_id);
+        userEmail = u?.user?.email ?? '';
+      } catch { /* email lookup non-fatal */ }
+    }
+
+    res.json({ ticket: { ...ticket, user_email: userEmail }, replies: replies ?? [] });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /api/admin/tickets/:id/reply ─────────────────────────────────────────
 router.post('/tickets/:id/reply', requireAdmin, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -191,6 +224,7 @@ router.post('/tickets/:id/reply', requireAdmin, async (req: Request, res: Respon
       if (error) throw error;
     }
 
+    let notified = false;
     if (message?.trim()) {
       const { error } = await db.from('support_ticket_replies').insert({
         ticket_id:       id,
@@ -198,9 +232,20 @@ router.post('/tickets/:id/reply', requireAdmin, async (req: Request, res: Respon
         is_staff_reply:  true,
       });
       if (error) throw error;
+
+      // Notify the ticket owner (only them) that support replied — non-blocking.
+      const { data: ticket } = await db
+        .from('support_tickets')
+        .select('user_id')
+        .eq('id', id)
+        .single();
+      if (ticket?.user_id) {
+        void notifySupportReply({ id: String(id), user_id: ticket.user_id });
+        notified = true;
+      }
     }
 
-    res.json({ success: true });
+    res.json({ success: true, notified });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
@@ -212,7 +257,7 @@ router.get('/reports', requireAdmin, async (req: Request, res: Response): Promis
     const { platform, status } = req.query;
     let query = db
       .from('scam_reports')
-      .select('id,seller_name,platform,description,amount_lost,status,admin_notes,reviewed_at,reporter_id,created_at,evidence_urls')
+      .select('id,seller_name,platform,seller_url,description,amount_lost,status,admin_notes,reviewed_at,reporter_id,created_at,evidence_urls')
       .order('created_at', { ascending: false })
       .limit(200);
     if (platform) query = query.eq('platform', platform as string);
@@ -229,10 +274,46 @@ router.get('/reports', requireAdmin, async (req: Request, res: Response): Promis
 // Override the generic GET above with status-filtered version when status param present
 // (the generic route already supports this via query param)
 
+// ── GET /api/admin/reports/:id ────────────────────────────────────────────────
+// Full report detail for the admin modal, enriched with the reporter's email.
+router.get('/reports/:id', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { data: report, error } = await db
+      .from('scam_reports')
+      .select('id,seller_name,platform,seller_url,description,amount_lost,status,admin_notes,reviewed_at,reviewed_by,reporter_id,created_at,evidence_urls')
+      .eq('id', id)
+      .single();
+    if (error) throw error;
+
+    let reporterEmail = '';
+    if (report?.reporter_id) {
+      try {
+        const { data: u } = await db.auth.admin.getUserById(report.reporter_id);
+        reporterEmail = u?.user?.email ?? '';
+      } catch { /* email lookup non-fatal */ }
+    }
+
+    res.json({ report: { ...report, reporter_email: reporterEmail } });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /api/admin/reports/:id/approve ──────────────────────────────────────
 router.post('/reports/:id/approve', requireAdmin, async (req: Request, res: Response): Promise<void> => {
   try {
     const { admin_notes } = req.body ?? {};
+
+    // Read current state first so we only notify on a real pending→approved
+    // transition (prevents duplicate scam-alert blasts on repeated approves).
+    const { data: existing } = await db
+      .from('scam_reports')
+      .select('status,platform')
+      .eq('id', req.params.id)
+      .single();
+    const wasApproved = existing?.status === 'approved';
+
     const { error } = await db.from('scam_reports').update({
       status:       'approved',
       admin_notes:  admin_notes ?? null,
@@ -241,7 +322,13 @@ router.post('/reports/:id/approve', requireAdmin, async (req: Request, res: Resp
     }).eq('id', req.params.id);
     if (error) throw error;
     console.log(`[Admin] Report ${req.params.id} APPROVED`);
-    res.json({ success: true, status: 'approved' });
+
+    // Notify users with scam-alert notifications enabled (non-blocking, dedup'd).
+    if (!wasApproved) {
+      void notifyScamAlertApproved({ id: String(req.params.id), platform: existing?.platform ?? null });
+    }
+
+    res.json({ success: true, status: 'approved', notified: !wasApproved });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
