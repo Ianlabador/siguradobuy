@@ -14,6 +14,7 @@ import adminRouter        from './routes/admin';
 import adminAnalyticsRouter from './routes/adminAnalytics';
 import analyticsRouter    from './routes/analytics';
 import paypalRouter       from './routes/paypal';
+import billingRouter      from './routes/billing';
 import legalRouter        from './routes/legal';
 
 dotenv.config();
@@ -64,6 +65,7 @@ app.use('/api/admin/analytics',               adminAnalyticsRouter);
 app.use('/api/admin',                         adminRouter);
 app.use('/api/analytics',     analyticsRateLimit, analyticsRouter);
 app.use('/api/paypal',                        paypalRouter);
+app.use('/api/billing',                       billingRouter);
 
 // Static public assets (logo for legal pages, etc.)
 app.use(express.static(path.join(__dirname, '../../public')));
