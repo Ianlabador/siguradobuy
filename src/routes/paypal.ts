@@ -5,14 +5,23 @@ import { activatePaidPayment } from '../services/billingActivation';
 
 const router = Router();
 
-const PAYPAL_MODE       = process.env.PAYPAL_MODE ?? 'sandbox';
-const PAYPAL_CLIENT_ID  = process.env.PAYPAL_CLIENT_ID ?? '';
-const PAYPAL_SECRET     = process.env.PAYPAL_CLIENT_SECRET ?? '';
-const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID ?? '';
+const PAYPAL_MODE       = (process.env.PAYPAL_MODE ?? 'sandbox').trim().toLowerCase();
+// Strip stray whitespace/newlines/quotes that can sneak in via env vars and break Basic auth.
+const clean = (v: string | undefined) => (v ?? '').trim().replace(/^["']|["']$/g, '');
+const PAYPAL_CLIENT_ID  = clean(process.env.PAYPAL_CLIENT_ID);
+const PAYPAL_SECRET     = clean(process.env.PAYPAL_CLIENT_SECRET);
+const PAYPAL_WEBHOOK_ID = clean(process.env.PAYPAL_WEBHOOK_ID);
 
-const PAYPAL_BASE = PAYPAL_MODE === 'production'
+// Accept BOTH 'live' and 'production' as the live environment. (PayPal docs say
+// "live"; the previous code only matched "production", so PAYPAL_MODE=live wrongly
+// used the sandbox URL with live credentials → 401.)
+const PAYPAL_LIVE = PAYPAL_MODE === 'live' || PAYPAL_MODE === 'production';
+const PAYPAL_BASE = PAYPAL_LIVE
   ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
+
+// Safe startup diagnostic — never logs the secret or full client id.
+console.log(`[PAYPAL_CONFIG] mode=${PAYPAL_MODE} live=${PAYPAL_LIVE} baseUrl=${PAYPAL_BASE} clientIdPresent=${!!PAYPAL_CLIENT_ID} secretPresent=${!!PAYPAL_SECRET} clientIdLast4=${PAYPAL_CLIENT_ID.slice(-4) || 'none'} webhookIdPresent=${!!PAYPAL_WEBHOOK_ID}`);
 
 // Public base URL of this API — used for PayPal return/cancel landing pages.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL ?? 'https://siguradobuy-production.up.railway.app').replace(/\/$/, '');
@@ -32,9 +41,9 @@ router.get('/status', (_req: Request, res: Response): void => {
 // SECURITY: without this, anyone could POST a fake ACTIVATED event to upgrade a user.
 async function verifyWebhookSignature(req: Request): Promise<boolean> {
   if (!PAYPAL_WEBHOOK_ID) {
-    // Not configured — refuse to trust unverified events in production.
-    if (PAYPAL_MODE === 'production') {
-      console.error('[PayPal Webhook] PAYPAL_WEBHOOK_ID not set — rejecting in production.');
+    // Not configured — refuse to trust unverified events in live mode.
+    if (PAYPAL_LIVE) {
+      console.error('[PAYPAL_WEBHOOK_REJECTED] PAYPAL_WEBHOOK_ID not set — rejecting in live mode.');
       return false;
     }
     console.warn('[PayPal Webhook] PAYPAL_WEBHOOK_ID not set — skipping verification (sandbox only).');
@@ -62,19 +71,36 @@ async function verifyWebhookSignature(req: Request): Promise<boolean> {
   }
 }
 
+// Thrown when PayPal rejects our credentials (so callers can return a clean error).
+class PayPalAuthError extends Error {}
+
 async function getPayPalToken(): Promise<string> {
   if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
-    throw new Error('PayPal credentials not configured on server');
+    throw new PayPalAuthError('PayPal credentials not configured on server');
   }
-  const { data } = await axios.post(
-    `${PAYPAL_BASE}/v1/oauth2/token`,
-    'grant_type=client_credentials',
-    {
-      auth: { username: PAYPAL_CLIENT_ID, password: PAYPAL_SECRET },
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    },
-  );
-  return data.access_token;
+  console.log(`[PAYPAL_TOKEN_REQUEST_START] baseUrl=${PAYPAL_BASE} live=${PAYPAL_LIVE}`);
+  try {
+    const { data } = await axios.post(
+      `${PAYPAL_BASE}/v1/oauth2/token`,
+      'grant_type=client_credentials',
+      {
+        auth: { username: PAYPAL_CLIENT_ID, password: PAYPAL_SECRET },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      },
+    );
+    console.log('[PAYPAL_TOKEN_REQUEST_SUCCESS]');
+    return data.access_token;
+  } catch (e: any) {
+    const status = e.response?.status;
+    // Safe error fields only — never the secret.
+    const name = e.response?.data?.error ?? e.code ?? 'unknown';
+    const msg  = e.response?.data?.error_description ?? e.message;
+    console.error(`[PAYPAL_TOKEN_REQUEST_FAIL] status=${status} paypalErrorName=${name} paypalErrorMessage=${msg}`);
+    if (status === 401) {
+      console.error('[PAYPAL_TOKEN_REQUEST_FAIL] 401 = PayPal rejected the credentials. Check: live keys copied from the LIVE REST app, no trailing spaces, PAYPAL_MODE=live, and the base URL matches the key environment.');
+    }
+    throw new PayPalAuthError(`PayPal auth failed (status ${status ?? 'n/a'})`);
+  }
 }
 
 // ── POST /api/paypal/create-order ─────────────────────────────────────────────
@@ -97,6 +123,7 @@ router.post('/create-order', async (req: Request, res: Response): Promise<void> 
     const amount = PRICES[plan];
     if (!amount) { res.status(400).json({ error: 'Invalid plan. Must be plus or pro.' }); return; }
 
+    console.log(`[PAYPAL_CREATE_ORDER_START] plan=${plan} amount=${amount} ${currency}`);
     const token = await getPayPalToken();
 
     const { data } = await axios.post(
@@ -138,11 +165,20 @@ router.post('/create-order', async (req: Request, res: Response): Promise<void> 
       external_payment_id: data.id,    // PayPal order id
     });
 
+    console.log(`[PAYPAL_CREATE_ORDER_SUCCESS] orderId=${data.id} status=${data.status}`);
     res.json({ orderId: data.id, status: data.status, approveUrl });
   } catch (e: any) {
-    const msg = e.response?.data?.message ?? e.message;
-    console.error('[PayPal] create-order error:', msg);
-    res.status(500).json({ error: msg });
+    // Credential rejection (401) → distinct code so the app shows the right message.
+    if (e instanceof PayPalAuthError) {
+      console.error('[PAYPAL_CREATE_ORDER_FAIL] reason=auth', e.message);
+      res.status(502).json({ error: 'paypal_auth_failed', message: 'PayPal payment is temporarily unavailable. Please try again later or use another payment method.' });
+      return;
+    }
+    const status = e.response?.status;
+    const safeName = e.response?.data?.name ?? e.code ?? 'unknown';
+    const debugId  = e.response?.data?.debug_id ?? null;
+    console.error(`[PAYPAL_CREATE_ORDER_FAIL] status=${status} name=${safeName} debugId=${debugId} msg=${e.message}`);
+    res.status(502).json({ error: 'paypal_unavailable', message: 'PayPal payment is temporarily unavailable. Please try again later or use another payment method.' });
   }
 });
 
@@ -223,10 +259,11 @@ router.post('/capture-order', async (req: Request, res: Response): Promise<void>
 // Verify the webhook signature before trusting any event.
 router.post('/webhook', async (req: Request, res: Response): Promise<void> => {
   try {
+    console.log(`[PAYPAL_WEBHOOK_RECEIVED] event_type=${req.body?.event_type} id=${req.body?.id}`);
     // SECURITY: verify the event genuinely came from PayPal before trusting it.
     const verified = await verifyWebhookSignature(req);
     if (!verified) {
-      console.error('[PayPal Webhook] Rejected unverified webhook event.');
+      console.error('[PAYPAL_WEBHOOK_REJECTED] signature verification failed');
       res.status(401).json({ error: 'Webhook signature verification failed' });
       return;
     }
@@ -236,7 +273,7 @@ router.post('/webhook', async (req: Request, res: Response): Promise<void> => {
     const eventType  = event.event_type as string | undefined;
     const resource   = event.resource   as Record<string, any> | undefined;
 
-    console.log(`[PayPal Webhook] event_type=${eventType} (verified)`);
+    console.log(`[PAYPAL_WEBHOOK_VERIFIED] [PAYPAL_WEBHOOK_EVENT_TYPE] ${eventType}`);
 
     if (!eventType || !resource) {
       res.status(400).json({ error: 'Missing event_type or resource' });
