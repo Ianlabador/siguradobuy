@@ -438,6 +438,117 @@ router.get('/checks', requireAdmin, async (req: Request, res: Response): Promise
   }
 });
 
+// ── GET /api/admin/billing ────────────────────────────────────────────────────
+// QR Ph / manual payment records, newest first, enriched with the payer's email.
+router.get('/billing', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { status } = req.query;
+    let query = db
+      .from('billing_payments')
+      .select('id,user_id,provider,plan,amount,currency,status,payment_reference,submitted_at,confirmed_at,rejected_at,plan_expires_at,admin_notes,created_at')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (status) query = query.eq('status', status as string);
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Build a user_id → email map in one call.
+    let emailMap = new Map<string, string>();
+    try {
+      const { data: authData } = await db.auth.admin.listUsers({ perPage: 1000 });
+      emailMap = new Map(authData.users.map(u => [u.id, u.email ?? '']));
+    } catch { /* email enrichment non-fatal */ }
+
+    const payments = (data ?? []).map((p: any) => ({ ...p, user_email: emailMap.get(p.user_id) ?? '' }));
+    res.json({ payments });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/admin/billing/qrph/:paymentId/confirm ───────────────────────────
+// Admin confirms a manual payment. This is the ONLY path that activates a plan.
+// Idempotent: confirming an already-paid record does not extend it again.
+router.post('/billing/qrph/:paymentId/confirm', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const id = String(req.params.paymentId);
+    const { admin_notes } = req.body ?? {};
+
+    const { data: pay, error } = await db.from('billing_payments').select('*').eq('id', id).single();
+    if (error || !pay) { res.status(404).json({ error: 'Payment not found' }); return; }
+    if (pay.status === 'paid') {
+      res.json({ success: true, status: 'paid', alreadyConfirmed: true, plan: pay.plan, plan_expires_at: pay.plan_expires_at });
+      return;
+    }
+
+    const now     = new Date();
+    const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days
+
+    // 1. Mark the payment paid.
+    const { error: payErr } = await db.from('billing_payments').update({
+      status:          'paid',
+      confirmed_at:    now.toISOString(),
+      plan_expires_at: expires,
+      admin_notes:     admin_notes ?? pay.admin_notes ?? null,
+      updated_at:      now.toISOString(),
+    }).eq('id', id);
+    if (payErr) throw payErr;
+
+    // 2. Activate the plan — core columns only, so it always applies.
+    const { error: coreErr } = await db.from('profiles').update({
+      plan:                pay.plan,
+      subscription_status: 'active',
+    }).eq('user_id', pay.user_id);
+    if (coreErr) console.error('[Admin Billing] profile core update error:', coreErr.message);
+
+    // 3. Best-effort enrichment (columns from migration 022). Non-fatal.
+    void db.from('profiles').update({
+      subscription_source: 'paymongo_qrph',
+      plan_updated_at:     now.toISOString(),
+      current_period_end:  expires,
+    }).eq('user_id', pay.user_id);
+
+    // 4. Billing-history event (non-fatal).
+    void db.from('subscription_events').insert({
+      user_id:    pay.user_id,
+      event_type: 'purchase',
+      plan:       pay.plan,
+      store:      'paymongo_qrph',
+    });
+
+    console.log(`[Admin Billing] Payment ${id} CONFIRMED — user=${pay.user_id} plan=${pay.plan}`);
+    res.json({ success: true, status: 'paid', plan: pay.plan, plan_expires_at: expires });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/admin/billing/qrph/:paymentId/reject ────────────────────────────
+// Admin rejects a manual payment. Does NOT touch the user's plan.
+router.post('/billing/qrph/:paymentId/reject', requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const id = String(req.params.paymentId);
+    const { admin_notes } = req.body ?? {};
+
+    const { data: pay, error } = await db.from('billing_payments').select('status').eq('id', id).single();
+    if (error || !pay) { res.status(404).json({ error: 'Payment not found' }); return; }
+    if (pay.status === 'paid') { res.status(400).json({ error: 'Cannot reject a payment that is already confirmed paid.' }); return; }
+
+    const { error: updErr } = await db.from('billing_payments').update({
+      status:      'rejected',
+      rejected_at: new Date().toISOString(),
+      admin_notes: admin_notes ?? null,
+      updated_at:  new Date().toISOString(),
+    }).eq('id', id);
+    if (updErr) throw updErr;
+
+    console.log(`[Admin Billing] Payment ${id} REJECTED`);
+    res.json({ success: true, status: 'rejected' });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /api/admin/verify ─────────────────────────────────────────────────────
 router.get('/verify', requireAdmin, (_req: Request, res: Response): void => {
   res.json({ valid: true });
