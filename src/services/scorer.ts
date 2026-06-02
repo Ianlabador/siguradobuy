@@ -218,8 +218,12 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   // Key fix: unknown ≠ safe. Missing data INCREASES uncertainty sub-scores.
   // These are NOT penalties for the seller — they're "we cannot evaluate" signals.
   let priceRaw   = hasPrice   ? 0  : 28;  // can't evaluate price fairness
-  let qualityRaw = hasReviews ? 0  : 22;  // can't verify buyer history
-  if (!hasSeller) sellerRaw += 22;        // anonymous seller is always risky
+  let qualityRaw = hasReviews ? 0  : 18;  // can't verify buyer history (limited data, not "bad")
+  if (!hasSeller) {
+    // On verified marketplaces (Shopee/Lazada) a missing seller is almost always
+    // an extraction gap, NOT an anonymous seller — treat it as limited data, not risk.
+    sellerRaw += (product.platform === 'shopee' || product.platform === 'lazada') ? 8 : 22;
+  }
 
   // ── 3. Partial / url-only additional caution ──────────────────────────────
   let scamRaw = 0;
@@ -305,30 +309,45 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   }
 
   // ── 6. Review / quality signals ───────────────────────────────────────────
+  // HONESTY RULE: `noReviews` means "confirmed zero reviews", NOT "we failed to
+  // extract review data". Missing review data is handled as limited data above,
+  // never as a fabricated "No reviews" signal.
   if (hasReviews) {
     if (product.reviewCount === 0) {
       signals.noReviews = true; qualityRaw += 18;
     } else if (product.reviewCount! < 5) {
       qualityRaw += 10;
-    }
-    // Has reviews: the missing-data floor doesn't apply (already conditional above)
-  } else {
-    // No review data — set noReviews signal if product is on a platform where we'd expect them
-    if (product.platform === 'shopee' || product.platform === 'lazada') {
-      signals.noReviews = true;
+    } else if (product.reviewCount! >= 100) {
+      // Lots of real buyers — strong legitimacy + quality signal.
+      qualityRaw = Math.max(0, qualityRaw - 8);
     }
   }
+  // else: review data missing → no signal set (limited verification only)
 
   if (hasRating) {
     if (product.rating! < 2.5) {
       signals.lowRating = true; qualityRaw += 22;
     } else if (product.rating! < 3.5) {
       signals.lowRating = true; qualityRaw += 12;
+    } else if (product.rating! >= 4.5 && (product.reviewCount ?? 0) >= 50) {
+      // High rating backed by many reviews → strong positive quality signal.
+      qualityRaw = Math.max(0, qualityRaw - 12);
     }
   }
 
   if (product.soldCount !== null && product.soldCount === 0) {
     signals.lowSoldCount = true; qualityRaw += 6;
+  } else if ((product.soldCount ?? 0) >= 500) {
+    // Many units sold → established, lower quality/scam concern.
+    qualityRaw = Math.max(0, qualityRaw - 6);
+    scamRaw    = Math.max(0, scamRaw - 4);
+  }
+
+  // Authenticity / verified-store badges (LazMall, Flagship, 100% Authentic) are
+  // strong seller-trust positives — reduce the seller risk dimension.
+  if (product.sellerBadges && product.sellerBadges.length > 0) {
+    const trusted = product.sellerBadges.some(b => /lazmall|flagship|authentic|money back|free return/i.test(b));
+    if (trusted) sellerRaw = Math.max(0, sellerRaw - 14);
   }
 
   // ── 7. Community reports by seller name ───────────────────────────────────
@@ -456,6 +475,17 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
       else                                        subScores.qualityScore = Math.max(subScores.qualityScore, 62);
     }
   }
+
+  // Per-dimension level helper for the requested diagnostic tags.
+  const lvl = (s: number) => (s >= 60 ? 'HIGH' : s >= 30 ? 'MEDIUM' : 'LOW');
+  const dataLevel =
+    conf >= 60 ? 'CLEAR' : conf >= 30 ? 'LIMITED' : 'VERY_LIMITED';
+  console.log(`[SCRAPER_MAPPED_RESULT] name="${product.productName}" price=${product.price} rating=${product.rating} reviews=${product.reviewCount} sold=${product.soldCount} seller="${product.sellerName}" conf=${conf}%`);
+  console.log(`[PRICE_RISK_LEVEL] ${hasPrice ? lvl(subScores.priceScore) : 'NO_DATA'} (priceAnomaly=${signals.priceAnomalyPercent}%)`);
+  console.log(`[QUALITY_RISK_LEVEL] ${hasReviews || hasRating ? lvl(subScores.qualityScore) : 'NO_DATA'}`);
+  console.log(`[SELLER_RISK_LEVEL] ${hasSeller ? lvl(subScores.sellerScore) : 'NO_DATA'}`);
+  console.log(`[SCAM_RISK_LEVEL] ${lvl(subScores.scamScore)}`);
+  console.log(`[EXTRACTION_CONFIDENCE] ${conf}% (${dataLevel})`);
 
   console.log(
     `[Scorer] → ${riskScore}/100 (${riskLevel.toUpperCase()}) | weighted=${weighted} floor=${minScore}`,
