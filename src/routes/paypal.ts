@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { db } from '../db/client';
+import { activatePaidPayment } from '../services/billingActivation';
 
 const router = Router();
 
@@ -124,6 +125,19 @@ router.post('/create-order', async (req: Request, res: Response): Promise<void> 
       links.find(l => l.rel === 'approve')?.href ??
       null;
 
+    // Create a pending billing_payments record so the webhook can match + activate.
+    void db.from('billing_payments').insert({
+      user_id:            userId,
+      provider:           'paypal',
+      payment_method:     'paypal',
+      plan,
+      amount:             parseFloat(amount),
+      currency,
+      status:             'pending',
+      payment_reference:  `SBPP-${plan.toUpperCase()}-${data.id}`,
+      external_payment_id: data.id,    // PayPal order id
+    });
+
     res.json({ orderId: data.id, status: data.status, approveUrl });
   } catch (e: any) {
     const msg = e.response?.data?.message ?? e.message;
@@ -172,41 +186,30 @@ router.post('/capture-order', async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Extract userId and plan from custom_id
-    const customId = data.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id ?? '';
+    // Extract the captured amount + custom_id (userId:plan) for validation.
+    const capture     = data.purchase_units?.[0]?.payments?.captures?.[0];
+    const customId    = capture?.custom_id ?? '';
+    const capturedAmt = capture?.amount?.value ? parseFloat(capture.amount.value) : null;
     const [userId, plan] = customId.split(':');
 
-    // Update Supabase subscription only after confirmed payment.
-    if (userId && plan) {
-      // Core update uses only columns guaranteed to exist, so the upgrade always
-      // applies even if the optional billing columns (migration 022) aren't there.
-      const { error: coreErr } = await db.from('profiles').update({
-        plan,
-        subscription_status: 'active',
-      }).eq('user_id', userId);
-      if (coreErr) console.error('[PayPal] capture core update error:', coreErr.message);
-
-      // Best-effort enrichment — these columns are added by migration 022. Non-fatal.
-      void db.from('profiles').update({
-        subscription_source: 'paypal',
-        plan_updated_at:     new Date().toISOString(),
-      }).eq('user_id', userId);
-
-      // Record a billing-history event (non-fatal if the table is absent).
-      void db.from('subscription_events').insert({
-        user_id:    userId,
-        event_type: 'purchase',
-        plan,
-        store:      'paypal',
-      });
-    }
+    // Activate via the unified helper: validates amount, dedups, marks the
+    // billing_payments row paid, and activates the plan for 30 days.
+    const result = await activatePaidPayment({
+      externalPaymentId: orderId,
+      provider:          'paypal',
+      paymentMethod:     'paypal',
+      reportedAmount:    capturedAmt,
+      rawMetadata:       { orderId, customId, source: 'capture-order' },
+    });
 
     res.json({
-      success: true,
+      success:        result.ok,
       orderId,
-      status:  data.status,
+      status:         data.status,
       plan,
       userId,
+      planExpiresAt:  result.planExpiresAt ?? null,
+      alreadyActive:  result.alreadyProcessed,
     });
   } catch (e: any) {
     const msg = e.response?.data?.message ?? e.message;
@@ -257,7 +260,58 @@ router.post('/webhook', async (req: Request, res: Response): Promise<void> => {
       if (error) console.error('[PayPal Webhook] DB update error:', error.message);
     }
 
+    const webhookEventId: string | null = event.id ?? null;
+
     switch (eventType) {
+
+      // ── One-time Orders flow (what this app uses) ──────────────────────────
+      case 'CHECKOUT.ORDER.APPROVED': {
+        // Buyer approved — capture server-side so activation is fully automatic
+        // (no reliance on the client calling capture-order).
+        const orderId: string = resource.id;
+        try {
+          const token = await getPayPalToken();
+          const { data: cap } = await axios.post(
+            `${PAYPAL_BASE}/v2/checkout/orders/${orderId}/capture`,
+            {},
+            { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } },
+          );
+          const capture = cap.purchase_units?.[0]?.payments?.captures?.[0];
+          const amt = capture?.amount?.value ? parseFloat(capture.amount.value) : null;
+          if (cap.status === 'COMPLETED') {
+            await activatePaidPayment({
+              externalPaymentId: orderId,
+              provider:          'paypal',
+              paymentMethod:     'paypal',
+              webhookEventId,
+              reportedAmount:    amt,
+              rawMetadata:       { orderId, source: 'webhook:ORDER.APPROVED' },
+            });
+          }
+        } catch (e: any) {
+          console.error('[PayPal Webhook] auto-capture failed:', e.response?.data ?? e.message);
+        }
+        break;
+      }
+
+      case 'PAYMENT.CAPTURE.COMPLETED': {
+        // Capture already happened (client or webhook). Activate idempotently.
+        const orderId: string | undefined = resource.supplementary_data?.related_ids?.order_id;
+        const amt = resource.amount?.value ? parseFloat(resource.amount.value) : null;
+        if (orderId) {
+          await activatePaidPayment({
+            externalPaymentId: orderId,
+            provider:          'paypal',
+            paymentMethod:     'paypal',
+            webhookEventId,
+            reportedAmount:    amt,
+            rawMetadata:       { orderId, captureId: resource.id, source: 'webhook:CAPTURE.COMPLETED' },
+          });
+        } else {
+          console.warn('[PayPal Webhook] CAPTURE.COMPLETED without related order_id — cannot match record.');
+        }
+        break;
+      }
 
       case 'BILLING.SUBSCRIPTION.ACTIVATED': {
         const customId: string = resource.custom_id ?? '';
