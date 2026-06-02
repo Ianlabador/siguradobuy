@@ -14,15 +14,117 @@
 import { Router, Request, Response } from 'express';
 import { randomBytes } from 'crypto';
 import { db } from '../db/client';
+import { createCheckoutSession, PAYMONGO_CONFIGURED, PAYMONGO_MODE } from '../services/paymongo';
 
 const router = Router();
 
 // Server is the source of truth for prices (₱).
 const PLAN_PRICES: Record<string, number> = { plus: 199, pro: 299 };
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL ?? 'https://siguradobuy-production.up.railway.app').replace(/\/$/, '');
 
 function genReference(plan: string): string {
   return `SBQR-${plan.toUpperCase()}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`.toUpperCase();
 }
+
+// ── GET /api/billing/paymongo/status (config) ─────────────────────────────────
+router.get('/paymongo/config', (_req: Request, res: Response): void => {
+  res.json({ configured: PAYMONGO_CONFIGURED, mode: PAYMONGO_MODE });
+});
+
+// ── POST /api/billing/paymongo/create-checkout ────────────────────────────────
+// Body: { userId, plan }. Creates a PayMongo hosted checkout + a pending record.
+// Falls back (503) when PayMongo isn't configured → mobile uses the static QR.
+router.post('/paymongo/create-checkout', async (req: Request, res: Response): Promise<void> => {
+  if (!PAYMONGO_CONFIGURED) {
+    res.status(503).json({ error: 'paymongo_not_configured', message: 'PayMongo is not configured on the server.' });
+    return;
+  }
+  try {
+    const { userId, plan } = req.body ?? {};
+    if (!userId) { res.status(400).json({ error: 'userId is required' }); return; }
+    if (plan !== 'plus' && plan !== 'pro') { res.status(400).json({ error: 'Invalid plan. Must be plus or pro.' }); return; }
+
+    const amount    = PLAN_PRICES[plan];            // backend-decided
+    const reference = genReference(plan);
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+    // 1. Create the pending record first so we have an id for metadata.
+    const { data: created, error: insErr } = await db.from('billing_payments').insert({
+      user_id:           userId,
+      provider:          'paymongo',
+      payment_method:    'qrph',
+      plan,
+      amount,
+      currency:          'PHP',
+      status:            'pending',
+      payment_reference: reference,
+      expires_at:        expiresAt,
+    }).select('id').single();
+    if (insErr || !created) { res.status(500).json({ error: insErr?.message ?? 'Could not create payment record' }); return; }
+
+    // 2. Create the PayMongo checkout session.
+    const session = await createCheckoutSession({
+      amountPhp:       amount,
+      plan,
+      referenceNumber: reference,
+      paymentId:       created.id,
+      userId,
+      successUrl:      `${PUBLIC_BASE_URL}/api/paymongo/return`,
+      cancelUrl:       `${PUBLIC_BASE_URL}/api/paymongo/cancel`,
+    });
+
+    // 3. Save the checkout id + url on the record.
+    await db.from('billing_payments').update({
+      external_checkout_id: session.id,
+      checkout_url:         session.checkoutUrl,
+      updated_at:           new Date().toISOString(),
+    }).eq('id', created.id);
+
+    res.json({ paymentId: created.id, checkout_url: session.checkoutUrl, plan, amount, currency: 'PHP', reference });
+  } catch (e: any) {
+    const msg = e.response?.data?.errors?.[0]?.detail ?? e.message;
+    console.error('[Billing] paymongo create-checkout error:', msg);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ── GET /api/billing/status/:paymentId ────────────────────────────────────────
+// Unified status poll for any provider. No secrets exposed.
+router.get('/status/:paymentId', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { data, error } = await db
+      .from('billing_payments')
+      .select('id,provider,payment_method,plan,amount,currency,status,plan_expires_at,confirmed_at,created_at')
+      .eq('id', String(req.params.paymentId))
+      .single();
+    if (error || !data) { res.status(404).json({ error: 'Payment not found' }); return; }
+
+    const messageMap: Record<string, string> = {
+      pending:         'Waiting for your payment to be confirmed.',
+      awaiting_review: 'Payment submitted — awaiting confirmation.',
+      paid:            'Payment confirmed. Your plan is active.',
+      failed:          'Payment failed. You have not been charged for an active plan.',
+      rejected:        'Payment was not approved. You remain on the Free plan.',
+      cancelled:       'Payment was cancelled.',
+      expired:         'This payment request expired. Please start again.',
+    };
+
+    res.json({
+      status:          data.status,
+      provider:        data.provider,
+      payment_method:  data.payment_method,
+      plan:            data.plan,
+      amount:          data.amount,
+      currency:        data.currency,
+      created_at:      data.created_at,
+      confirmed_at:    data.confirmed_at,
+      plan_expires_at: data.plan_expires_at,
+      message:         messageMap[data.status] ?? '',
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── POST /api/billing/qrph/create-pending ─────────────────────────────────────
 // Body: { userId, plan: 'plus' | 'pro' }
