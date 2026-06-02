@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { extractFromUrl } from '../services/extractor';
 import { scoreProduct, upsertSellerProfile } from '../services/scorer';
-import { analyzeWithAI } from '../services/ai';
+import { analyzeWithAI, AI_PROVIDER, AI_MODEL } from '../services/ai';
 import { db } from '../db/client';
 import { normalizeUrl } from '../services/urlNormalizer';
 import { validateCheckUrl } from '../services/urlGuard';
@@ -144,6 +144,8 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
   // ── AI explanation (Plus/Pro only) ─────────────────────────────────────────
   let aiResult = { summary: null as string | null, factors: [] as string[], recommendation: null as string | null };
   let aiUsed = false;
+  let aiTokens: number | null = null;
+  let aiStatus: 'success' | 'fallback' | 'error' = 'success';
 
   if (hasAI && !isLocked && userId) {
     const { data: aiQuota } = await db.rpc('consume_ai_check', {
@@ -152,27 +154,19 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     });
 
     if (aiQuota?.status === 'ok') {
-      try {
-        const ai = await analyzeWithAI(product, scoring);
-        aiResult = { summary: ai.summary, factors: ai.factors, recommendation: ai.recommendation };
-        aiUsed = true;
-        console.log(`[Check] AI → used:true summary_len:${ai.summary?.length ?? 0}`);
-      } catch (e: any) {
-        console.error('[Check] AI failed:', e.message);
-      }
-
-      await db.from('ai_usage_logs').insert({
-        user_id:      userId,
-        feature_type: 'url_analysis',
-        input_type:   'url',
-        plan:         planAtCheck,
-        tokens_used:  null,
-      });
+      // analyzeWithAI never throws — it returns a rule-based fallback on any error,
+      // so the product check always succeeds even if OpenAI is down.
+      const ai = await analyzeWithAI(product, scoring);
+      aiResult = { summary: ai.summary, factors: ai.factors, recommendation: ai.recommendation };
+      aiUsed   = true;
+      aiTokens = ai.tokensUsed ?? null;
+      aiStatus = ai.status ?? 'success';
+      console.log(`[Check] AI → used:true status:${aiStatus} tokens:${aiTokens} summary_len:${ai.summary?.length ?? 0}`);
     } else {
       console.log(`[Check] AI skipped: ${aiQuota?.status}`);
     }
   } else {
-    console.log(`[Check] AI skipped: hasAI=${hasAI} locked=${isLocked} userId=${!!userId}`);
+    console.log(`[Check] AI skipped (free/locked/guest): hasAI=${hasAI} locked=${isLocked} userId=${!!userId}`);
   }
 
   // ── Upsert seller profile ─────────────────────────────────────────────────
@@ -213,6 +207,25 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     confidence:     product.confidence ?? null,
   });
   if (insertError) console.error('[Check] DB insert error:', insertError.message);
+
+  // ── AI usage log (after the product_checks row exists, so check_id is valid) ──
+  if (aiUsed && userId) {
+    // Core columns are guaranteed; provider/status come from migration 025 (best-effort).
+    const { data: logRow, error: logErr } = await db.from('ai_usage_logs').insert({
+      user_id:      userId,
+      check_id:     insertError ? null : checkId,
+      feature_type: 'url_analysis',
+      input_type:   'url',
+      plan:         planAtCheck,
+      tokens_used:  aiTokens,
+      model:        AI_MODEL,
+    }).select('id').single();
+    if (logErr) console.error('[Check] ai_usage_logs insert error:', logErr.message);
+    else if (logRow) {
+      // Enrich with provider/status if those columns exist (migration 025). Non-fatal.
+      void db.from('ai_usage_logs').update({ provider: AI_PROVIDER, status: aiStatus }).eq('id', logRow.id);
+    }
+  }
 
   console.log(`[Check] Done in ${Date.now() - startMs}ms | checkId:${checkId} locked:${isLocked}\n`);
 
