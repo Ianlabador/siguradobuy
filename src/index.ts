@@ -16,6 +16,7 @@ import analyticsRouter    from './routes/analytics';
 import paypalRouter       from './routes/paypal';
 import billingRouter      from './routes/billing';
 import paymongoRouter     from './routes/paymongo';
+import aiRouter           from './routes/ai';
 import legalRouter        from './routes/legal';
 
 dotenv.config();
@@ -57,7 +58,8 @@ app.get('/health', (_req, res) => {
     timestamp: new Date().toISOString(),
     supabase:  !!process.env.SUPABASE_URL,
     ai:        !!process.env.OPENAI_API_KEY,
-    billing:   !!process.env.REVENUECAT_WEBHOOK_SECRET,
+    aiProvider: 'openai',
+    billing:   (!!process.env.PAYPAL_CLIENT_ID && !!process.env.PAYPAL_CLIENT_SECRET) || !!process.env.PAYMONGO_SECRET_KEY,
   });
 });
 
@@ -73,6 +75,7 @@ app.use('/api/analytics',     analyticsRateLimit, analyticsRouter);
 app.use('/api/paypal',                        paypalRouter);
 app.use('/api/billing',                       billingRouter);
 app.use('/api/paymongo',                      paymongoRouter);
+app.use('/api/ai',                            aiRouter);
 
 // Static public assets (logo for legal pages, etc.)
 app.use(express.static(path.join(__dirname, '../../public')));
@@ -96,17 +99,19 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 app.listen(PORT, () => {
-  const serviceKey = process.env.SUPABASE_SERVICE_KEY;
-  const aiKey      = process.env.ANTHROPIC_API_KEY;
-  const rcSecret   = process.env.REVENUECAT_WEBHOOK_SECRET;
+  const serviceKey  = process.env.SUPABASE_SERVICE_KEY;
+  const openaiKey   = process.env.OPENAI_API_KEY;   // this app's AI provider
+  const paypalReady = !!process.env.PAYPAL_CLIENT_ID && !!process.env.PAYPAL_CLIENT_SECRET;
+  const paymongoReady = !!process.env.PAYMONGO_SECRET_KEY;
   console.log(`
 ╔════════════════════════════════════════════╗
-║   SiguradoBuy API v2.0                     ║
-║   Port:         ${PORT}                        ║
-║   Supabase:     ${process.env.SUPABASE_URL ? '✓ connected' : '✗ missing URL'}           ║
-║   Service key:  ${serviceKey ? '✓ set' : '✗ missing (using anon)'}      ║
-║   AI (Claude):  ${aiKey ? '✓ set' : '✗ missing — add key'}     ║
-║   RevenueCat:   ${rcSecret ? '✓ webhook secret set' : '✗ missing webhook secret'} ║
+║   SiguradoBuy API v2.0
+║   Port:         ${PORT}
+║   Supabase:     ${process.env.SUPABASE_URL ? '✓ connected' : '✗ missing URL'}
+║   Service key:  ${serviceKey ? '✓ set' : '✗ missing (using anon)'}
+║   OpenAI:       ${openaiKey ? '✓ configured (gpt-4o-mini)' : '✗ missing OPENAI_API_KEY'}
+║   PayPal:       ${paypalReady ? '✓ configured' : '✗ not configured'}
+║   PayMongo:     ${paymongoReady ? '✓ configured' : 'static QR fallback (no key)'}
 ╚════════════════════════════════════════════╝
   `);
 });
