@@ -442,13 +442,14 @@ router.get('/checks', requireAdmin, async (req: Request, res: Response): Promise
 // QR Ph / manual payment records, newest first, enriched with the payer's email.
 router.get('/billing', requireAdmin, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { status } = req.query;
+    const { status, provider } = req.query;
     let query = db
       .from('billing_payments')
-      .select('id,user_id,provider,plan,amount,currency,status,payment_reference,submitted_at,confirmed_at,rejected_at,plan_expires_at,admin_notes,created_at')
+      .select('id,user_id,provider,payment_method,plan,amount,currency,status,payment_reference,external_payment_id,external_checkout_id,webhook_event_id,submitted_at,confirmed_at,rejected_at,plan_expires_at,admin_notes,created_at')
       .order('created_at', { ascending: false })
       .limit(200);
-    if (status) query = query.eq('status', status as string);
+    if (status)   query = query.eq('status', status as string);
+    if (provider) query = query.eq('provider', provider as string);
     const { data, error } = await query;
     if (error) throw error;
 
