@@ -26,6 +26,7 @@ export interface ExtractedProduct {
   description:      string | null;
   category:         string | null;
   sellerAge:        string | null;
+  sellerBadges:     string[] | null;   // LazMall / Flagship / 100% Authentic / etc.
   rawUrl:           string;
   resolvedUrl:      string;
   partial:          boolean;
@@ -43,20 +44,24 @@ export interface ExtractedProduct {
 // e.g. Facebook doesn't expose seller info → don't penalise for it being missing.
 
 export function calculateConfidence(product: Partial<ExtractedProduct>): number {
+  // Field-weighted: confidence reflects exactly what we actually extracted.
+  //   title=10, price=15, seller=15, rating=15, reviews=15, sold=10, desc=10, badges=10
   let score = 0;
-  if (product.productName)    score += 20;
-  if (product.price)          score += 20;
-  if (product.sellerName)     score += 20;
-  if (product.rating    != null) score += 15;
-  if (product.reviewCount != null) score += 15;
-  if (product.description)    score += 10;
+  if (product.productName)               score += 10;
+  if (product.price)                     score += 15;
+  if (product.sellerName)                score += 15;
+  if (product.rating      != null)       score += 15;
+  if (product.reviewCount != null)       score += 15;
+  if (product.soldCount   != null)       score += 10;
+  if (product.description)               score += 10;
+  if (product.sellerBadges && product.sellerBadges.length) score += 10;
 
   // Platforms where seller info is structurally unavailable: don't double-penalise
   // by expecting it. Cap confidence at 80 for Facebook/TikTok since we can't get seller data.
   const platform = (product as any).platform as string | undefined;
   if ((platform === 'facebook' || platform === 'tiktok') && score > 80) score = 80;
 
-  return score;
+  return Math.min(100, score);
 }
 
 // ─── Apify result cache (24-hour TTL, in-memory) ──────────────────────────────
@@ -169,11 +174,47 @@ async function scrapeShopee(url: string): Promise<Scraped> {
   }
 }
 
+// Parse Lazada-style compact counts: "3.9K sold" → 3900, "1.2K" → 1200, "2M" → 2_000_000.
+function parseCompactNumber(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const m = String(raw).replace(/,/g, '').match(/([\d.]+)\s*([KkMm]?)/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (isNaN(n)) return null;
+  const unit = m[2].toUpperCase();
+  if (unit === 'K') return Math.round(n * 1_000);
+  if (unit === 'M') return Math.round(n * 1_000_000);
+  return Math.round(n);
+}
+
+function firstMatch(text: string, patterns: RegExp[]): string | null {
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m && m[1] != null) return m[1];
+  }
+  return null;
+}
+
 async function scrapeLazada(url: string): Promise<Scraped> {
   try {
-    const res = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' }, timeout: 8000 });
+    // Lazada serves richer HTML to a real mobile UA than to a bare client.
+    const res = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-PH,en;q=0.9',
+      },
+      timeout: 9000,
+    });
     const $ = cheerio.load(res.data);
-    let productName: string | null = null; let price: number | null = null; let sellerName: string | null = null; let rating: number | null = null; let reviewCount: number | null = null; let soldCount: number | null = null;
+    const html: string = typeof res.data === 'string' ? res.data : '';
+
+    let productName: string | null = null; let price: number | null = null; let sellerName: string | null = null;
+    let rating: number | null = null; let reviewCount: number | null = null; let soldCount: number | null = null;
+    let description: string | null = null;
+    const badges: string[] = [];
+
+    // 1. JSON-LD (when present).
     $('script[type="application/ld+json"]').each((_, el) => {
       try {
         const json = JSON.parse($(el).html() ?? '');
@@ -182,26 +223,95 @@ async function scrapeLazada(url: string): Promise<Scraped> {
           if (item['@type'] === 'Product' || item.name) {
             productName = item.name ?? productName;
             const rp = item.offers?.price ?? item.price;
-            if (rp) price = typeof rp === 'string' ? parseFloat(rp.replace(/,/g, '')) : rp;
-            rating = item.aggregateRating?.ratingValue ?? rating;
+            if (rp) price = typeof rp === 'string' ? parseFloat(String(rp).replace(/,/g, '')) : rp;
+            rating = item.aggregateRating?.ratingValue ? parseFloat(item.aggregateRating.ratingValue) : rating;
             reviewCount = item.aggregateRating?.reviewCount ?? item.aggregateRating?.ratingCount ?? reviewCount;
             sellerName = item.brand?.name ?? item.seller?.name ?? sellerName;
           }
         }
       } catch { /* skip */ }
     });
+
+    // 2. og: meta fallbacks.
     const ogTitle = $('meta[property="og:title"]').attr('content') ?? $('title').text() ?? null;
     const ogPrice = $('meta[property="product:price:amount"]').attr('content') ?? null;
-    productName = productName ?? ogTitle;
+    const ogDesc  = $('meta[property="og:description"]').attr('content') ?? null;
+    productName = productName ?? (ogTitle ? ogTitle.replace(/\s*[-|:]\s*Lazada.*$/i, '').trim() : null);
     price = price ?? (ogPrice ? parseFloat(ogPrice) : null);
-    const scriptText = $('script').map((_, el) => $(el).html() ?? '').get().join(' ');
-    if (!sellerName) { const m = scriptText.match(/"sellerName":\s*"([^"]+)"/); if (m) sellerName = m[1]; }
-    const sm = scriptText.match(/"sold":\s*(\d+)/); if (sm) soldCount = parseInt(sm[1]);
-    const rm = scriptText.match(/"rating":\s*"?(\d+\.?\d*)"?/); if (!rating && rm) rating = parseFloat(rm[1]);
-    const rcm = scriptText.match(/"reviewCount":\s*(\d+)/); if (!reviewCount && rcm) reviewCount = parseInt(rcm[1]);
-    console.log(`[W1] Lazada: "${productName}" ₱${price} seller:${sellerName}`);
-    return { productName, price, sellerName, rating, reviewCount, soldCount, extractMethod: productName ? 'html_jsonld' : 'og' };
-  } catch { return { extractMethod: 'url_only' }; }
+    description = description ?? (ogDesc ? ogDesc.slice(0, 400) : null);
+
+    // 3. Embedded PDP data (Lazada's __moduleData__ / app.run blob). Field-level
+    //    regex is far more robust than parsing the whole giant JSON object.
+    const scriptText = html || $('script').map((_, el) => $(el).html() ?? '').get().join(' ');
+
+    if (!price) {
+      const pr = firstMatch(scriptText, [
+        /"salePrice"\s*:\s*"?([\d.,]+)"?/,
+        /"price"\s*:\s*"?([\d.,]+)"?/,
+        /"priceNumber"\s*:\s*"?([\d.,]+)"?/,
+      ]);
+      if (pr) price = parseFloat(pr.replace(/,/g, ''));
+    }
+    if (rating == null) {
+      const rt = firstMatch(scriptText, [
+        /"ratingScore"\s*:\s*"?([\d.]+)"?/,
+        /"averageRating"\s*:\s*"?([\d.]+)"?/,
+        /"average"\s*:\s*"?([\d.]+)"?/,
+        /"rating"\s*:\s*"?([\d.]+)"?/,
+      ]);
+      if (rt) { const v = parseFloat(rt); if (v > 0 && v <= 5) rating = v; }
+    }
+    if (reviewCount == null) {
+      const rc = firstMatch(scriptText, [
+        /"totalReviews"\s*:\s*"?([\d,]+)"?/,
+        /"reviewCount"\s*:\s*"?([\d,]+)"?/,
+        /"ratingCount"\s*:\s*"?([\d,]+)"?/,
+        /"review"\s*:\s*\{[^}]*?"total"\s*:\s*"?([\d,]+)"?/,
+      ]);
+      if (rc) reviewCount = parseInt(rc.replace(/,/g, ''), 10);
+    }
+    if (soldCount == null) {
+      const sc = firstMatch(scriptText, [
+        /"itemSoldCntShow"\s*:\s*"([^"]+)"/,
+        /"soldCount"\s*:\s*"?([\d.,KkMm]+)"?/,
+        /"sold"\s*:\s*"?([\d.,KkMm]+)"?/,
+      ]);
+      if (sc) soldCount = parseCompactNumber(sc);
+    }
+    if (!sellerName) {
+      sellerName = firstMatch(scriptText, [
+        /"sellerName"\s*:\s*"([^"]+)"/,
+        /"storeName"\s*:\s*"([^"]+)"/,
+        /"shopName"\s*:\s*"([^"]+)"/,
+      ]);
+    }
+
+    // 4. Authenticity / store badges (best-effort flags for the seller dimension).
+    for (const b of ['LazMall', 'Flagship Store', '100% Authentic', 'Authentic', 'Money Back', 'Free Return']) {
+      if (scriptText.includes(b) || html.includes(b)) badges.push(b);
+    }
+
+    const extractMethod = productName ? (rating != null || reviewCount != null ? 'html_embedded' : 'html_jsonld') : 'og';
+
+    // ── Required diagnostic logs ───────────────────────────────────────────────
+    console.log(`[SCRAPER_RAW_RESULT] lazada name="${productName}" price=${price} rating=${rating} reviews=${reviewCount} sold=${soldCount} seller="${sellerName}" badges=[${badges.join(',')}]`);
+    console.log(`[LAZADA_EXTRACT_TITLE] ${productName}`);
+    console.log(`[LAZADA_EXTRACT_PRICE] ${price}`);
+    console.log(`[LAZADA_EXTRACT_RATING] ${rating}`);
+    console.log(`[LAZADA_EXTRACT_REVIEWS] ${reviewCount}`);
+    console.log(`[LAZADA_EXTRACT_SOLD] ${soldCount}`);
+    console.log(`[LAZADA_EXTRACT_SELLER] ${sellerName}`);
+    console.log(`[LAZADA_EXTRACT_BADGES] ${badges.join(',') || 'none'}`);
+
+    return {
+      productName, price, sellerName, rating, reviewCount, soldCount, description,
+      sellerBadges: badges.length ? badges : undefined,
+      extractMethod,
+    } as Scraped;
+  } catch (e: any) {
+    console.log(`[LAZADA_EXTRACT] failed: ${e.message}`);
+    return { extractMethod: 'url_only' };
+  }
 }
 
 async function scrapeTikTok(url: string): Promise<Scraped> {
@@ -448,6 +558,7 @@ function _buildProduct(
     description:      scraped.description  ?? null,
     category:         (scraped as any).category ?? null,
     sellerAge:        null,
+    sellerBadges:     scraped.sellerBadges ?? null,
     rawUrl,
     resolvedUrl,
     partial,
