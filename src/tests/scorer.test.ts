@@ -29,6 +29,7 @@ function makeProduct(overrides: Partial<ExtractedProduct>): ExtractedProduct {
     description:      null,
     category:         null,
     sellerAge:        null,
+    sellerBadges:     null,
     rawUrl:           'https://shopee.ph/test',
     resolvedUrl:      'https://shopee.ph/test',
     partial:          false,
