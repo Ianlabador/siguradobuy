@@ -15,6 +15,7 @@ import adminAnalyticsRouter from './routes/adminAnalytics';
 import analyticsRouter    from './routes/analytics';
 import paypalRouter       from './routes/paypal';
 import billingRouter      from './routes/billing';
+import paymongoRouter     from './routes/paymongo';
 import legalRouter        from './routes/legal';
 
 dotenv.config();
@@ -38,7 +39,12 @@ const allowedOrigins: string | string[] = (() => {
 })();
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.use(express.json({ limit: '10mb' }));
+// Capture the raw request body so webhook signatures (PayMongo HMAC) can be
+// verified against the exact bytes received, while still parsing JSON normally.
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => { (req as any).rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true }));
 app.use(globalRateLimit);
 
@@ -66,6 +72,7 @@ app.use('/api/admin',                         adminRouter);
 app.use('/api/analytics',     analyticsRateLimit, analyticsRouter);
 app.use('/api/paypal',                        paypalRouter);
 app.use('/api/billing',                       billingRouter);
+app.use('/api/paymongo',                      paymongoRouter);
 
 // Static public assets (logo for legal pages, etc.)
 app.use(express.static(path.join(__dirname, '../../public')));
