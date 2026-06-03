@@ -8,6 +8,8 @@ const router = Router();
 const APP_ADS_FALLBACK = [
   '#Appodeal',
   'appodeal.com, 264393, DIRECT',
+  '#Google AdMob',
+  'google.com, pub-8086500041326014, DIRECT, f08c47fec0942fa0',
   '#BidMachine',
   'bidmachine.io,1,DIRECT',
   'bidmachine.io,466,DIRECT',
