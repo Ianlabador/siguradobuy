@@ -34,7 +34,7 @@ router.get('/app-ads.txt', (_req: Request, res: Response) => {
   res.send(APP_ADS_FALLBACK);
 });
 
-const UPDATED = 'May 30, 2026';
+const UPDATED = 'June 10, 2026';
 
 // ─── Shared responsive black/gold page shell ────────────────────────────────────
 function page(title: string, bodyHtml: string): string {
@@ -93,7 +93,9 @@ router.get('/privacy', (_req: Request, res: Response) => {
     <ul>
       <li>Account info you provide (email address) when you sign in.</li>
       <li>Product links you submit for analysis.</li>
+      <li>Product screenshots or images you upload for analysis (if you choose to).</li>
       <li>Scam reports and support tickets you submit.</li>
+      <li>A push notification token (if you enable notifications) so we can send the alerts you opted into.</li>
       <li>Basic device and usage data needed to run the app and serve ads.</li>
     </ul>
 
@@ -107,22 +109,25 @@ router.get('/privacy', (_req: Request, res: Response) => {
     <p>Reports you submit are reviewed by our team. Approved reports may be shown publicly (without exposing your identity) to warn other buyers. Disapproved reports stay hidden.</p>
 
     <h2>6. Account and Billing Information</h2>
-    <p>Subscription and payment processing for paid plans is handled by <strong>PayPal</strong>. We do not store your full card details. We store your plan status to unlock features.</p>
+    <p>Subscription and payment processing for paid plans is handled by <strong>PayPal</strong> and <strong>PayMongo</strong>. We do not store your full card details. We store your plan status to unlock features.</p>
 
     <h2>7. Ads and Rewarded Ads</h2>
-    <p>Free users may watch rewarded ads for extra checks. Ads are served through <strong>Appodeal</strong> mediation and its advertising partners (including <strong>Unity Ads</strong>). These partners may collect device identifiers and ad-interaction data to deliver and measure ads, subject to their own policies.</p>
+    <p>Free users may watch rewarded ads for extra checks. Ads are served through <strong>Appodeal</strong> mediation and its advertising partners (including <strong>Unity Ads</strong> and <strong>Google AdMob</strong>). These partners may collect device identifiers and ad-interaction data to deliver and measure ads, subject to their own policies.</p>
 
-    <h2>8. Third-Party Services</h2>
-    <p>We use third-party providers to operate the app, which may process limited data: <strong>Supabase</strong> (database/auth), <strong>Railway</strong> (backend hosting), <strong>Appodeal/Unity</strong> (ads), <strong>PayPal</strong> (payments), and an AI provider for risk explanations. We share only what is necessary for these services to function.</p>
+    <h2>8. Push Notifications</h2>
+    <p>If you enable notifications, we collect a push notification token to deliver the alerts you opt into (scam alerts, support replies, and billing updates). Notifications are sent via the <strong>Expo</strong> push service. You can turn each notification type on or off in the app's Settings, and you can disable notifications entirely in your device settings. We do not send notifications for categories you have turned off.</p>
 
-    <h2>9. Data Security</h2>
-    <p>We use industry-standard measures (encryption in transit, access controls) to protect your data. No method is 100% secure, but we work to keep your information safe.</p>
+    <h2>9. Third-Party Services</h2>
+    <p>We use third-party providers to operate the app, which may process limited data: <strong>Supabase</strong> (database/auth), <strong>Railway</strong> (backend hosting), <strong>Appodeal / Unity Ads / Google AdMob</strong> (ads), <strong>PayPal / PayMongo</strong> (payments), <strong>Expo</strong> (push notification delivery), and an AI provider for risk explanations. We share only what is necessary for these services to function.</p>
 
-    <h2>10. User Choices</h2>
-    <p>You can use the app as a guest with limited features, manage notifications in Settings, and request account deletion via a support ticket. You may stop using the app at any time.</p>
+    <h2>10. Data Security and Retention</h2>
+    <p>We use industry-standard measures (encryption in transit, access controls) to protect your data. We retain your data for as long as your account is active or as needed to provide the service, and remove it on account deletion except where we must keep records for legal or accounting reasons. No method is 100% secure, but we work to keep your information safe.</p>
 
-    <h2>11. Contact / Support</h2>
-    <p>For privacy questions, use the in-app Support tab to reach our team.</p>
+    <h2>11. User Choices and Account Deletion</h2>
+    <p>You can use the app as a guest with limited features, and manage notifications in Settings. To delete your account and associated data, open <strong>Settings → Delete Account</strong> or submit a support ticket; we process deletion requests within a reasonable period and remove your personal data except records we are legally required to retain. You may stop using the app at any time.</p>
+
+    <h2>12. Contact / Support</h2>
+    <p>For privacy questions or to request account deletion, use the in-app Support tab to reach our team.</p>
 
     <div class="card">
       <strong>Honest note:</strong> SiguradoBuy provides risk estimates only. We do not sell your personal data, but ad and payment partners listed above do process data needed to provide their services.
@@ -181,5 +186,47 @@ router.get('/terms', (_req: Request, res: Response) => {
     </div>`;
   res.set('Content-Type', 'text/html; charset=utf-8').send(page('Terms of Service', body));
 });
+
+// ─── GET /delete-account — Google Play account/data deletion page ─────────────────
+function deletionPage(_req: Request, res: Response) {
+  const body = `
+    <h2>Deleting Your SiguradoBuy Account and Data</h2>
+    <p>This page explains how to request deletion of your <strong>SiguradoBuy</strong> account and the data associated with it, in line with Google Play's user data deletion requirements.</p>
+
+    <h2>Option 1 — Delete your entire account (in the app)</h2>
+    <ol>
+      <li>Open the SiguradoBuy app.</li>
+      <li>Go to <strong>Settings → Delete Account</strong>.</li>
+      <li>Confirm the request. Our team processes account deletions within <strong>30 days</strong>.</li>
+    </ol>
+
+    <h2>Option 2 — Request deletion by email / support</h2>
+    <p>You can also request account deletion, or deletion of <strong>specific data</strong> without deleting your whole account (for example, your check history or scam reports), by:</p>
+    <ul>
+      <li>Using the in-app <strong>Support</strong> tab to submit a request, or</li>
+      <li>Emailing us at <strong>siguradobuygenlinked@gmail.com</strong> with the subject "Delete my data" from the email address on your account.</li>
+    </ul>
+    <p>Please tell us whether you want your entire account deleted, or only specific data removed.</p>
+
+    <h2>What data is deleted</h2>
+    <ul>
+      <li>Your account and email address</li>
+      <li>Your product check history and any product links/images you submitted</li>
+      <li>Your scam reports' link to your identity (public anonymized warnings may remain to protect other buyers)</li>
+      <li>Your notification preferences and push notification token</li>
+      <li>Your app settings and preferences</li>
+    </ul>
+
+    <h2>What data may be kept, and for how long</h2>
+    <p>We may retain a limited record of <strong>subscription/payment transactions</strong> where we are required to for legal, tax, or accounting purposes. These records are kept only as long as the law requires (typically up to <strong>5 years</strong>) and are not used for any other purpose. Everything else is deleted.</p>
+
+    <div class="card">
+      <strong>Need help?</strong> If you have any trouble deleting your account or data, contact us through the in-app Support tab or at siguradobuygenlinked@gmail.com and we will assist you.
+    </div>`;
+  res.set('Content-Type', 'text/html; charset=utf-8').send(page('Delete Account & Data', body));
+}
+
+router.get('/delete-account', deletionPage);
+router.get('/delete-data', deletionPage);
 
 export default router;
