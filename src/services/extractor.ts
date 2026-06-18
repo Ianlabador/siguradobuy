@@ -110,9 +110,9 @@ async function resolveUrl(url: string): Promise<string> {
 
 export function detectPlatform(url: string): Platform {
   const u = url.toLowerCase();
-  if (u.includes('shopee.ph') || u.includes('shope.ee'))                         return 'shopee';
+  if (u.includes('shopee.ph') || u.includes('shope.ee') || u.includes('shp.ee')) return 'shopee';
   if (u.includes('lazada.com.ph') || u.includes('lzd.co') || u.includes('i.lazada.com.ph')) return 'lazada';
-  if (u.includes('tiktok.com') || u.includes('shop.tiktok') || u.includes('vt.tiktok.com')) return 'tiktok';
+  if (u.includes('tiktok.com') || u.includes('shop.tiktok') || u.includes('vt.tiktok.com') || u.includes('vm.tiktok.com')) return 'tiktok';
   if (u.includes('facebook.com') || u.includes('fb.com') || u.includes('fb.watch') || u.includes('fb.me')) return 'facebook';
   return 'other';
 }
@@ -455,11 +455,18 @@ function extractSellerIdFromUrl(url: string, platform: Platform): string | null 
 export async function extractFromUrl(url: string, isPaidPlan = false, forceDeepScan = false): Promise<ExtractedProduct> {
   const rawUrl = url;
 
-  // Resolve short URLs
+  // Resolve short URLs (redirects) before extraction. Shopee/Lazada/TikTok all use
+  // multiple short-link domains; if we don't expand them we can't scrape the real
+  // listing AND we can't detect the platform → everything falls back to a caution score.
+  const SHORT_LINK_DOMAINS = [
+    'shp.ee', 's.shopee.ph', 'shope.ee', 'shopee.ph/share', // Shopee
+    'lzd.co', 's.lazada.com.ph',                            // Lazada
+    'vt.tiktok.com', 'vm.tiktok.com',                       // TikTok
+  ];
   let resolvedUrl = url;
-  if (url.includes('shope.ee') || url.includes('lzd.co') || url.includes('vt.tiktok.com') || url.includes('vm.tiktok.com')) {
+  if (SHORT_LINK_DOMAINS.some(d => url.includes(d))) {
     resolvedUrl = await resolveUrl(url);
-    console.log(`[Extractor] Resolved → ${resolvedUrl}`);
+    console.log(`[Extractor] Resolved short link → ${resolvedUrl}`);
   }
 
   const platform = (() => {
