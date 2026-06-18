@@ -1,16 +1,18 @@
 /**
  * auth.ts — Custom email OTP verification (pure code, no Supabase, no DB).
  *
- * Flow: send-otp → user receives a 6-digit code → verify-otp.
- * The mobile app only calls supabase.auth.signUp AFTER the code is verified,
- * so fake/typo emails never become accounts.
+ * Sends via Brevo's HTTPS API (Railway blocks SMTP ports, so Gmail/nodemailer
+ * times out — an HTTP API on port 443 works fine).
  *
- * Codes live in memory (short-lived). Needs GMAIL_USER + GMAIL_APP_PASSWORD env.
- * Logos are served from api/public (EMAIL_ASSET_BASE overrides the base URL).
+ * Flow: send-otp → user receives a 6-digit code → verify-otp.
+ * The mobile app only calls supabase.auth.signUp AFTER the code is verified.
+ *
+ * Env: BREVO_API_KEY (required), EMAIL_FROM or GMAIL_USER (verified Brevo sender),
+ *      EMAIL_ASSET_BASE (optional, for logo URLs).
  */
 
 import { Router, Request, Response } from 'express';
-import nodemailer from 'nodemailer';
+import axios from 'axios';
 
 const router = Router();
 
@@ -35,30 +37,32 @@ function normalizeEmail(e: string): string { return e.trim().toLowerCase(); }
 function genCode(): string { return String(Math.floor(100000 + Math.random() * 900000)); }
 function isValidEmail(e: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
-// ─── Gmail transporter (lazy) ─────────────────────────────────────────────────
-// Use explicit SMTP host + port 587 (STARTTLS). Railway commonly blocks port 465,
-// so the default `service: 'gmail'` (which uses 465) times out. 587 often works.
-let transporter: nodemailer.Transporter | null = null;
-function getTransporter(): nodemailer.Transporter | null {
-  if (transporter) return transporter;
-  const user = process.env.GMAIL_USER;
-  const pass = process.env.GMAIL_APP_PASSWORD;
-  if (!user || !pass) return null;
-  transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,        // STARTTLS (not SMTPS/465)
-    requireTLS: true,
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    auth: { user, pass },
-  });
-  return transporter;
+// ─── Email sender (Brevo HTTPS API) ───────────────────────────────────────────
+const SENDER_EMAIL = process.env.EMAIL_FROM || process.env.GMAIL_USER || 'siguradobuygenlinked@gmail.com';
+const SENDER_NAME  = 'SiguradoBuy';
+
+async function sendOtpEmail(to: string, code: string): Promise<void> {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) throw new Error('BREVO_API_KEY not set');
+
+  await axios.post(
+    'https://api.brevo.com/v3/smtp/email',
+    {
+      sender:      { name: SENDER_NAME, email: SENDER_EMAIL },
+      to:          [{ email: to }],
+      subject:     `Your SiguradoBuy code is ${code}`,
+      htmlContent: emailHtml(code),
+      textContent: `Your SiguradoBuy verification code is ${code}. It expires in 10 minutes.`,
+    },
+    {
+      headers: { 'api-key': apiKey, 'Content-Type': 'application/json', 'accept': 'application/json' },
+      timeout: 15000,
+    },
+  );
 }
 
 // ─── Styled HTML email (logo header + Powered by Genlinked footer) ────────────
 function emailHtml(code: string): string {
-  // Logos are served from the API's public folder. Override with EMAIL_ASSET_BASE if needed.
   const assetBase = process.env.EMAIL_ASSET_BASE || 'https://siguradobuy-production.up.railway.app';
   const year = new Date().getFullYear();
   return `<!DOCTYPE html>
@@ -129,9 +133,8 @@ router.post('/send-otp', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  const transport = getTransporter();
-  if (!transport) {
-    console.error('[OTP] GMAIL_USER / GMAIL_APP_PASSWORD not set');
+  if (!process.env.BREVO_API_KEY) {
+    console.error('[OTP] BREVO_API_KEY not set');
     res.status(500).json({ error: 'Email service is not configured yet. Please try again later.' });
     return;
   }
@@ -140,17 +143,12 @@ router.post('/send-otp', async (req: Request, res: Response): Promise<void> => {
   otpStore.set(email, { code, expiresAt: now + CODE_TTL_MS, attempts: 0, lastSentAt: now, verified: false });
 
   try {
-    await transport.sendMail({
-      from: `"SiguradoBuy" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: `Your SiguradoBuy code is ${code}`,
-      text: `Your SiguradoBuy verification code is ${code}. It expires in 10 minutes.`,
-      html: emailHtml(code),
-    });
+    await sendOtpEmail(email, code);
     console.log(`[OTP] sent to ${email}`);
     res.json({ success: true, message: 'Verification code sent.' });
   } catch (e: any) {
-    console.error('[OTP] send failed:', e?.message);
+    const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message ?? 'unknown');
+    console.error('[OTP] send failed:', detail);
     otpStore.delete(email);
     res.status(500).json({ error: 'Could not send the verification email. Check the address and try again.' });
   }
@@ -181,7 +179,7 @@ router.post('/verify-otp', (req: Request, res: Response): void => {
   }
 
   entry.verified = true;
-  entry.expiresAt = Date.now() + VERIFIED_TTL_MS; // keep "verified" alive long enough to finish signup
+  entry.expiresAt = Date.now() + VERIFIED_TTL_MS;
   res.json({ success: true, verified: true });
 });
 
