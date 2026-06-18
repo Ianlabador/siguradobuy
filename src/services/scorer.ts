@@ -28,6 +28,7 @@ export interface SubScores {
 export interface ScoringResult {
   riskScore:  number;
   riskLevel:  'low' | 'medium' | 'high';
+  unverified: boolean;   // true = we could not read enough to judge — show "Couldn't verify"
   signals:    RiskSignals;
   subScores:  SubScores;
 }
@@ -205,7 +206,6 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   const isPartial   = product.partial || isUrlOnly;
 
   // ── 1. Platform base risk → seller sub-score ──────────────────────────────
-  // Key fix: platform risk MUST show in the seller breakdown, not just the total.
   let sellerRaw  = platformSellerRisk(product.platform);
 
   if (product.platform === 'facebook' || product.platform === 'other') {
@@ -215,20 +215,15 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   }
 
   // ── 2. Missing data uncertainty → caution floors ──────────────────────────
-  // Key fix: unknown ≠ safe. Missing data INCREASES uncertainty sub-scores.
-  // These are NOT penalties for the seller — they're "we cannot evaluate" signals.
   let priceRaw   = hasPrice   ? 0  : 28;  // can't evaluate price fairness
   let qualityRaw = hasReviews ? 0  : 18;  // can't verify buyer history (limited data, not "bad")
   if (!hasSeller) {
-    // On verified marketplaces (Shopee/Lazada) a missing seller is almost always
-    // an extraction gap, NOT an anonymous seller — treat it as limited data, not risk.
     sellerRaw += (product.platform === 'shopee' || product.platform === 'lazada') ? 8 : 22;
   }
 
   // ── 3. Partial / url-only additional caution ──────────────────────────────
   let scamRaw = 0;
   if (isUrlOnly) {
-    // We know NOTHING about this listing — treat all dimensions with caution
     scamRaw    += 18;
     sellerRaw  += 12;
     qualityRaw += 12;
@@ -241,12 +236,11 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
 
   // Missing multiple core fields together
   if (!product.productName) scamRaw   += 6;
-  if (!product.price)       priceRaw  += 8;  // stacks on top of the floor
+  if (!product.price)       priceRaw  += 8;
   if (!product.sellerName)  sellerRaw += 5;
 
   // ── 4. Price anomaly: DB baseline first, then heuristics ─────────────────
   if (hasPrice) {
-    // 4a. Check DB baseline
     if (product.productName) {
       try {
         const baseline = await getPriceBaseline(product.productName);
@@ -264,7 +258,6 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
       } catch { /* DB unavailable — continue with heuristics */ }
     }
 
-    // 4b. Heuristic price check (works without DB)
     if (!signals.priceAnomaly) {
       const ph = checkSuspiciousPrice(product.price!, product.productName);
       if (ph.isSuspicious) {
@@ -292,7 +285,6 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
         } else if (ageDays < 90) {
           sellerRaw += 8;
         }
-        // Established sellers (>90 days): no additional penalty
 
         signals.communityReports = sp.report_count;
         const reportPenalty = Math.min(sp.report_count * 14, 50);
@@ -302,27 +294,21 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
         const trustPenalty = Math.floor((100 - sp.trust_score) / 6);
         sellerRaw += trustPenalty;
       } else {
-        // Seller not in our DB — unknown seller on this platform
         sellerRaw += 10;
       }
     } catch { /* DB unavailable */ }
   }
 
   // ── 6. Review / quality signals ───────────────────────────────────────────
-  // HONESTY RULE: `noReviews` means "confirmed zero reviews", NOT "we failed to
-  // extract review data". Missing review data is handled as limited data above,
-  // never as a fabricated "No reviews" signal.
   if (hasReviews) {
     if (product.reviewCount === 0) {
       signals.noReviews = true; qualityRaw += 18;
     } else if (product.reviewCount! < 5) {
       qualityRaw += 10;
     } else if (product.reviewCount! >= 100) {
-      // Lots of real buyers — strong legitimacy + quality signal.
       qualityRaw = Math.max(0, qualityRaw - 8);
     }
   }
-  // else: review data missing → no signal set (limited verification only)
 
   if (hasRating) {
     if (product.rating! < 2.5) {
@@ -330,7 +316,6 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
     } else if (product.rating! < 3.5) {
       signals.lowRating = true; qualityRaw += 12;
     } else if (product.rating! >= 4.5 && (product.reviewCount ?? 0) >= 50) {
-      // High rating backed by many reviews → strong positive quality signal.
       qualityRaw = Math.max(0, qualityRaw - 12);
     }
   }
@@ -338,13 +323,10 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   if (product.soldCount !== null && product.soldCount === 0) {
     signals.lowSoldCount = true; qualityRaw += 6;
   } else if ((product.soldCount ?? 0) >= 500) {
-    // Many units sold → established, lower quality/scam concern.
     qualityRaw = Math.max(0, qualityRaw - 6);
     scamRaw    = Math.max(0, scamRaw - 4);
   }
 
-  // Authenticity / verified-store badges (LazMall, Flagship, 100% Authentic) are
-  // strong seller-trust positives — reduce the seller risk dimension.
   if (product.sellerBadges && product.sellerBadges.length > 0) {
     const trusted = product.sellerBadges.some(b => /lazmall|flagship|authentic|money back|free return/i.test(b));
     if (trusted) sellerRaw = Math.max(0, sellerRaw - 14);
@@ -388,8 +370,6 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   }
 
   // ── 9. Low-confidence penalty → quality sub-score ─────────────────────────
-  // Skip for url_only: the isUrlOnly penalty above already accounts for missing data.
-  // Applying both would double-penalise and push quality too high artificially.
   if (conf < 60 && !isUrlOnly) {
     const penalty = Math.round((60 - conf) * 0.4);
     qualityRaw += penalty;
@@ -406,18 +386,13 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   };
 
   // ── Price anomaly cross-contribution ─────────────────────────────────────
-  // When price is suspiciously low, it strongly implies a scam — not just a price issue.
-  // Cross-pollinate into scamScore so the overall score reflects this correctly.
   if (signals.priceAnomaly && priceRaw >= 40) {
     scamRaw = Math.max(scamRaw, Math.round(priceRaw * 0.55));
     subScores.scamScore = clamp(scamRaw);
   }
 
-  // ── 11. Overall score: weighted + max-floor ───────────────────────────────
+  // ── 11. Overall score ─────────────────────────────────────────────────────
   // Weighted: scam=35%, seller=30%, quality=20%, price=15%
-  // PLUS: when any single dimension is in the high/medium range, the overall
-  // score is floored to at least that range — prevents a single red flag being
-  // "diluted away" by other low sub-scores.
   const weighted = Math.round(
     subScores.scamScore    * 0.35 +
     subScores.sellerScore  * 0.30 +
@@ -425,54 +400,82 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
     subScores.priceScore   * 0.15,
   );
 
-  // Max-sub-score floor: a single HIGH sub-score must elevate the overall level.
-  // This prevents a genuine red flag being "diluted away" by low scores elsewhere.
-  const maxSubScore = Math.max(subScores.scamScore, subScores.sellerScore, subScores.priceScore, subScores.qualityScore);
-  const subFloor =
-    maxSubScore >= 62 ? 62 :  // any sub-score is HIGH → overall must be High
-    maxSubScore >= 45 ? 45 :  // any sub is medium-high → overall ≥ Medium
-    maxSubScore >= 30 ? 30 :  // any sub is medium → overall ≥ medium-low
-    0;
+  // Real, listing-specific risk evidence — NOT platform guesses or missing-data caution.
+  const hasQualityData      = hasReviews || hasRating;
+  const hasRealRiskEvidence =
+    signals.priceAnomaly ||
+    signals.communityReports > 0 ||
+    signals.keywordsFound.length > 0 ||
+    signals.lowRating ||
+    signals.noReviews;
+  // Low confidence = we couldn't read enough to trust platform/seller guesses.
+  const isLowConf = conf < 40 || isUrlOnly;
 
-  // ── 12. Platform / data-quality floors ────────────────────────────────────
-  let minScore = 0;
-  if (isUrlOnly) {
-    minScore = product.platform === 'facebook' ? 50 : 42;
-  } else if (isPartial || conf < 30) {
-    minScore = product.platform === 'facebook' ? 44 : 38;
-  } else if (product.platform === 'facebook') {
-    minScore = 32;
-  } else if (product.platform === 'tiktok') {
-    minScore = 30; // TikTok always at least medium — unverified seller ecosystem
-  }
+  let riskScore: number;
+  let riskLevel: 'low' | 'medium' | 'high';
+  let unverified = false;
+  let scoreMode  = 'normal';
 
-  const riskScore = Math.min(100, Math.max(minScore, subFloor, weighted));
-  // Medium threshold lowered to 30: having any medium-range signal (score 30+)
-  // is enough to warrant a caution rating, not just a blanket "low risk".
-  const riskLevel: 'low' | 'medium' | 'high' =
-    riskScore >= 60 ? 'high' : riskScore >= 30 ? 'medium' : 'low';
+  if (isLowConf && !hasRealRiskEvidence && !hasQualityData) {
+    // ── UNVERIFIED: nothing real to judge ────────────────────────────────────
+    // Never fabricate a confident High/Medium from platform base or missing data.
+    // This is the "Couldn't verify this listing" state.
+    unverified = true;
+    scoreMode  = 'unverified';
+    riskScore  = 35;            // calm "Caution — couldn't verify", never a fake HIGH
+    riskLevel  = 'medium';
+    // Neutralise the breakdown so it can't show "High Risk Seller" with no seller data.
+    subScores.scamScore    = Math.min(subScores.scamScore,    20);
+    subScores.priceScore   = Math.min(subScores.priceScore,   20);
+    subScores.sellerScore  = Math.min(subScores.sellerScore,  20);
+    subScores.qualityScore = Math.min(subScores.qualityScore, 20);
+  } else if (isLowConf) {
+    // ── LOW CONFIDENCE with real signals → trust REVIEWS & RATINGS ───────────
+    // Ignore platform base + missing-data floors; let real evidence decide.
+    // Good ratings/reviews → low; bad ratings / reports / scam keywords → high.
+    riskScore = clamp(Math.max(
+      subScores.qualityScore,                                    // reviews & ratings (primary)
+      subScores.scamScore,                                       // keywords / community reports
+      signals.priceAnomaly         ? subScores.priceScore  : 0,  // genuine price anomaly
+      signals.communityReports > 0 ? subScores.sellerScore : 0,  // reported seller
+    ));
+    riskLevel = riskScore >= 60 ? 'high' : riskScore >= 30 ? 'medium' : 'low';
+    scoreMode = 'low-conf/reviews-focus';
+  } else {
+    // ── NORMAL: enough data → weighted + floors ──────────────────────────────
+    const maxSubScore = Math.max(subScores.scamScore, subScores.sellerScore, subScores.priceScore, subScores.qualityScore);
+    const subFloor =
+      maxSubScore >= 62 ? 62 :
+      maxSubScore >= 45 ? 45 :
+      maxSubScore >= 30 ? 30 : 0;
 
-  // ── 13. Consistency enforcement ───────────────────────────────────────────
-  // Sub-scores must EXPLAIN the overall level — no "all Low" when overall is Medium/High.
-  if (riskLevel !== 'low') {
-    const allSubsBelow30 = subScores.scamScore < 30 && subScores.sellerScore < 30 &&
-                           subScores.priceScore < 30 && subScores.qualityScore < 30;
-    if (allSubsBelow30) {
-      const targetFloor = riskLevel === 'high' ? 42 : 30;
-      subScores.sellerScore  = Math.max(subScores.sellerScore,  targetFloor);
-      subScores.qualityScore = Math.max(subScores.qualityScore, 28);
+    let minScore = 0;
+    if (product.platform === 'facebook') minScore = 32;
+    else if (product.platform === 'tiktok') minScore = 30;
+
+    riskScore = Math.min(100, Math.max(minScore, subFloor, weighted));
+    riskLevel = riskScore >= 60 ? 'high' : riskScore >= 30 ? 'medium' : 'low';
+
+    // ── Consistency enforcement: sub-scores must explain the overall level ────
+    if (riskLevel !== 'low') {
+      const allSubsBelow30 = subScores.scamScore < 30 && subScores.sellerScore < 30 &&
+                             subScores.priceScore < 30 && subScores.qualityScore < 30;
+      if (allSubsBelow30) {
+        const targetFloor = riskLevel === 'high' ? 42 : 30;
+        subScores.sellerScore  = Math.max(subScores.sellerScore,  targetFloor);
+        subScores.qualityScore = Math.max(subScores.qualityScore, 28);
+      }
     }
-  }
-
-  if (riskLevel === 'high') {
-    const anyHigh = subScores.scamScore >= 60 || subScores.sellerScore >= 60 ||
-                    subScores.priceScore >= 60 || subScores.qualityScore >= 60;
-    if (!anyHigh) {
-      const maxSub = Math.max(subScores.scamScore, subScores.sellerScore, subScores.priceScore, subScores.qualityScore);
-      if      (subScores.scamScore   === maxSub) subScores.scamScore   = Math.max(subScores.scamScore,   62);
-      else if (subScores.sellerScore === maxSub) subScores.sellerScore = Math.max(subScores.sellerScore, 62);
-      else if (subScores.priceScore  === maxSub) subScores.priceScore  = Math.max(subScores.priceScore,  62);
-      else                                        subScores.qualityScore = Math.max(subScores.qualityScore, 62);
+    if (riskLevel === 'high') {
+      const anyHigh = subScores.scamScore >= 60 || subScores.sellerScore >= 60 ||
+                      subScores.priceScore >= 60 || subScores.qualityScore >= 60;
+      if (!anyHigh) {
+        const maxSub = Math.max(subScores.scamScore, subScores.sellerScore, subScores.priceScore, subScores.qualityScore);
+        if      (subScores.scamScore   === maxSub) subScores.scamScore   = Math.max(subScores.scamScore,   62);
+        else if (subScores.sellerScore === maxSub) subScores.sellerScore = Math.max(subScores.sellerScore, 62);
+        else if (subScores.priceScore  === maxSub) subScores.priceScore  = Math.max(subScores.priceScore,  62);
+        else                                        subScores.qualityScore = Math.max(subScores.qualityScore, 62);
+      }
     }
   }
 
@@ -488,7 +491,7 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
   console.log(`[EXTRACTION_CONFIDENCE] ${conf}% (${dataLevel})`);
 
   console.log(
-    `[Scorer] → ${riskScore}/100 (${riskLevel.toUpperCase()}) | weighted=${weighted} floor=${minScore}`,
+    `[Scorer] → ${riskScore}/100 (${riskLevel.toUpperCase()}) | mode=${scoreMode} unverified=${unverified} weighted=${weighted}`,
     `| sub scam=${subScores.scamScore} price=${subScores.priceScore}`,
     `seller=${subScores.sellerScore} quality=${subScores.qualityScore}`,
     `| conf=${conf}% partial=${isPartial}`,
@@ -496,7 +499,7 @@ export async function scoreProduct(product: ExtractedProduct): Promise<ScoringRe
     `| reports=${signals.communityReports} priceAnomaly=${signals.priceAnomalyPercent}%`,
   );
 
-  return { riskScore, riskLevel, signals, subScores };
+  return { riskScore, riskLevel, unverified, signals, subScores };
 }
 
 // ─── Seller profile upsert ────────────────────────────────────────────────────
