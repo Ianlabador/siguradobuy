@@ -77,7 +77,8 @@ function emailHtml(code: string): string {
 
         <!-- Logo -->
         <tr><td align="center" style="padding:32px 32px 8px;">
-          <img src="${assetBase}/siguradobuy-logo.png" alt="SiguradoBuy" width="180"
+          <img src="${assetBase}/siguradobuy-logo.png.png"
+ alt="SiguradoBuy" width="180"
                style="display:block;max-width:180px;height:auto;border:0;" />
         </td></tr>
 
@@ -115,7 +116,8 @@ function emailHtml(code: string): string {
         <!-- Footer: Powered by Genlinked -->
         <tr><td align="center" style="padding:24px 36px 30px;">
           <p style="margin:0 0 10px;color:#9CA3AF;font-family:Arial,Helvetica,sans-serif;font-size:11px;letter-spacing:1px;">POWERED BY</p>
-          <img src="${assetBase}/genlinked-logo.png" alt="Genlinked" width="120"
+          <img src="${assetBase}/genlinked-logo.png.png"
+ alt="Genlinked" width="120"
                style="display:block;margin:0 auto;max-width:120px;height:auto;border:0;" />
           <p style="margin:18px 0 0;color:#9CA3AF;font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:17px;">
             SiguradoBuy helps Filipino shoppers spot online scams before paying.
