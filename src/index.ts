@@ -18,6 +18,7 @@ import billingRouter      from './routes/billing';
 import paymongoRouter     from './routes/paymongo';
 import aiRouter           from './routes/ai';
 import legalRouter        from './routes/legal';
+import authRouter         from './routes/auth';
 
 dotenv.config();
 
@@ -76,6 +77,8 @@ app.use('/api/paypal',                        paypalRouter);
 app.use('/api/billing',                       billingRouter);
 app.use('/api/paymongo',                      paymongoRouter);
 app.use('/api/ai',                            aiRouter);
+app.use('/api/auth',                          authRouter);
+
 
 // Static public assets (logo for legal pages, etc.)
 app.use(express.static(path.join(__dirname, '../../public')));
