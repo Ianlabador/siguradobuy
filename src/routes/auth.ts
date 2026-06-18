@@ -36,13 +36,23 @@ function genCode(): string { return String(Math.floor(100000 + Math.random() * 9
 function isValidEmail(e: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
 // ─── Gmail transporter (lazy) ─────────────────────────────────────────────────
+// Use explicit SMTP host + port 587 (STARTTLS). Railway commonly blocks port 465,
+// so the default `service: 'gmail'` (which uses 465) times out. 587 often works.
 let transporter: nodemailer.Transporter | null = null;
 function getTransporter(): nodemailer.Transporter | null {
   if (transporter) return transporter;
   const user = process.env.GMAIL_USER;
   const pass = process.env.GMAIL_APP_PASSWORD;
   if (!user || !pass) return null;
-  transporter = nodemailer.createTransport({ service: 'gmail', auth: { user, pass } });
+  transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,        // STARTTLS (not SMTPS/465)
+    requireTLS: true,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    auth: { user, pass },
+  });
   return transporter;
 }
 
