@@ -81,7 +81,7 @@ interface JsonLdProduct {
 }
 
 // Pull Product data from any JSON-LD blocks on the page (price, rating, reviews, desc).
-function extractJsonLd($: cheerio.CheerioAPI): JsonLdProduct {
+function extractJsonLd($: ReturnType<typeof cheerio.load>): JsonLdProduct {
   const out: JsonLdProduct = { productName: null, price: null, rating: null, reviewCount: null, description: null, sellerName: null };
 
   $('script[type="application/ld+json"]').each((_, el) => {
@@ -109,7 +109,7 @@ function extractJsonLd($: cheerio.CheerioAPI): JsonLdProduct {
 }
 
 // og: meta description fallback.
-function ogDescription($: cheerio.CheerioAPI): string | null {
+function ogDescription($: ReturnType<typeof cheerio.load>): string | null {
   const d = $('meta[property="og:description"]').attr('content') ?? $('meta[name="description"]').attr('content') ?? null;
   return d ? d.slice(0, 600) : null;
 }
